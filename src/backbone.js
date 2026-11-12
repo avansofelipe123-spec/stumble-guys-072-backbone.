@@ -1,32 +1,20 @@
 
-const crypto = require("crypto");
+function registerBackboneRoutes(app, pool, accountAuth) {
+    const express = require("express");
+    const router = express.Router();
 
-const ROOM_PREFIX = "SGX";
-const ROOM_DIGITS = 4;
-const DEFAULT_MAX_PLAYERS = 4;
-const MAX_PLAYERS_LIMIT = 16;
-
-function generateRoomCode() {
-    const number = crypto.randomInt(0, 10000);
-    return ROOM_PREFIX + String(number).padStart(ROOM_DIGITS, "0");
-}
-
-function registerBackboneRoutes(app, pool) {
+    // Todas as rotas exigem uma conta autenticada.
+    router.use(accountAuth);
 
     // Criar sala
-    app.post("/api/backbone/rooms", async (req, res) => {
-        const { playerId, maxPlayers = DEFAULT_MAX_PLAYERS } = req.body;
-
-        if (!Number.isInteger(playerId) || playerId <= 0) {
-            return res.status(400).json({
-                error: "Invalid player ID"
-            });
-        }
+    router.post("/rooms", async (req, res) => {
+        const playerId = req.player.id;
+        const maxPlayers = req.body.maxPlayers ?? 4;
 
         if (
             !Number.isInteger(maxPlayers) ||
             maxPlayers < 2 ||
-            maxPlayers > MAX_PLAYERS_LIMIT
+            maxPlayers > 16
         ) {
             return res.status(400).json({
                 error: "Invalid player limit"
@@ -38,44 +26,39 @@ function registerBackboneRoutes(app, pool) {
         try {
             await client.query("BEGIN");
 
-            let code;
-            let created = false;
+            let room = null;
 
-            for (let attempt = 0; attempt < 20; attempt++) {
-                code = generateRoomCode();
+            for (let attempt = 0; attempt < 30; attempt++) {
+                const number = require("crypto").randomInt(0, 10000);
+                const code = "SGX" + String(number).padStart(4, "0");
 
                 const result = await client.query(
                     `INSERT INTO backbone_rooms
                     (code, owner_player_id, max_players)
                     VALUES ($1, $2, $3)
                     ON CONFLICT (code) DO NOTHING
-                    RETURNING id, code, owner_player_id, max_players, status`,
+                    RETURNING *`,
                     [code, playerId, maxPlayers]
                 );
 
                 if (result.rowCount > 0) {
-                    created = true;
+                    room = result.rows[0];
                     break;
                 }
             }
 
-            if (!created) {
+            if (!room) {
                 await client.query("ROLLBACK");
                 return res.status(503).json({
-                    error: "Could not generate a room code"
+                    error: "Could not generate room code"
                 });
             }
-
-            const room = await client.query(
-                `SELECT id FROM backbone_rooms WHERE code = $1`,
-                [code]
-            );
 
             await client.query(
                 `INSERT INTO backbone_room_members
                 (room_id, player_id)
                 VALUES ($1, $2)`,
-                [room.rows[0].id, playerId]
+                [room.id, playerId]
             );
 
             await client.query("COMMIT");
@@ -83,16 +66,15 @@ function registerBackboneRoutes(app, pool) {
             res.status(201).json({
                 success: true,
                 room: {
-                    code,
+                    code: room.code,
                     ownerPlayerId: playerId,
-                    maxPlayers,
-                    status: "waiting"
+                    maxPlayers: room.max_players,
+                    status: room.status
                 }
             });
-
         } catch (error) {
             await client.query("ROLLBACK");
-            console.error("Create room error:", error);
+            console.error("Create room:", error);
 
             res.status(500).json({
                 error: "Could not create room"
@@ -103,8 +85,8 @@ function registerBackboneRoutes(app, pool) {
     });
 
     // Consultar sala e jogadores
-    app.get("/api/backbone/rooms/:code", async (req, res) => {
-        const code = String(req.params.code || "").toUpperCase();
+    router.get("/rooms/:code", async (req, res) => {
+        const code = String(req.params.code).toUpperCase();
 
         if (!/^SGX\d{4}$/.test(code)) {
             return res.status(400).json({
@@ -149,9 +131,8 @@ function registerBackboneRoutes(app, pool) {
                 success: true,
                 room: result.rows[0]
             });
-
         } catch (error) {
-            console.error("Get room error:", error);
+            console.error("Get room:", error);
 
             res.status(500).json({
                 error: "Could not get room"
@@ -159,46 +140,43 @@ function registerBackboneRoutes(app, pool) {
         }
     });
 
-    // Entrar em uma sala
-    app.post("/api/backbone/rooms/:code/join", async (req, res) => {
-        const code = String(req.params.code || "").toUpperCase();
-        const { playerId } = req.body;
+    // Entrar na sala
+    router.post("/rooms/:code/join", async (req, res) => {
+        const code = String(req.params.code).toUpperCase();
+        const playerId = req.player.id;
+        const client = await pool.connect();
 
         if (!/^SGX\d{4}$/.test(code)) {
+            client.release();
+
             return res.status(400).json({
                 error: "Invalid room code"
             });
         }
 
-        if (!Number.isInteger(playerId) || playerId <= 0) {
-            return res.status(400).json({
-                error: "Invalid player ID"
-            });
-        }
-
-        const client = await pool.connect();
-
         try {
             await client.query("BEGIN");
 
-            const roomResult = await client.query(
+            const result = await client.query(
                 `SELECT * FROM backbone_rooms
                 WHERE code = $1
                 FOR UPDATE`,
                 [code]
             );
 
-            if (roomResult.rowCount === 0) {
+            if (result.rowCount === 0) {
                 await client.query("ROLLBACK");
+
                 return res.status(404).json({
                     error: "Room not found"
                 });
             }
 
-            const room = roomResult.rows[0];
+            const room = result.rows[0];
 
             if (room.status !== "waiting") {
                 await client.query("ROLLBACK");
+
                 return res.status(409).json({
                     error: "Room is not accepting players"
                 });
@@ -220,6 +198,7 @@ function registerBackboneRoutes(app, pool) {
 
                 if (count.rows[0].total >= room.max_players) {
                     await client.query("ROLLBACK");
+
                     return res.status(409).json({
                         error: "Room is full"
                     });
@@ -240,10 +219,9 @@ function registerBackboneRoutes(app, pool) {
                 code,
                 message: "Joined room"
             });
-
         } catch (error) {
             await client.query("ROLLBACK");
-            console.error("Join room error:", error);
+            console.error("Join room:", error);
 
             res.status(500).json({
                 error: "Could not join room"
@@ -254,30 +232,37 @@ function registerBackboneRoutes(app, pool) {
     });
 
     // Sair da sala
-    app.post("/api/backbone/rooms/:code/leave", async (req, res) => {
-        const code = String(req.params.code || "").toUpperCase();
-        const { playerId } = req.body;
-
-        if (!Number.isInteger(playerId) || playerId <= 0) {
-            return res.status(400).json({
-                error: "Invalid player ID"
-            });
-        }
+    router.post("/rooms/:code/leave", async (req, res) => {
+        const code = String(req.params.code).toUpperCase();
+        const playerId = req.player.id;
 
         try {
-            const roomResult = await pool.query(
-                `SELECT id, owner_player_id FROM backbone_rooms
+            const result = await pool.query(
+                `SELECT id, owner_player_id
+                FROM backbone_rooms
                 WHERE code = $1`,
                 [code]
             );
 
-            if (roomResult.rowCount === 0) {
+            if (result.rowCount === 0) {
                 return res.status(404).json({
                     error: "Room not found"
                 });
             }
 
-            const room = roomResult.rows[0];
+            const room = result.rows[0];
+
+            const membership = await pool.query(
+                `SELECT id FROM backbone_room_members
+                WHERE room_id = $1 AND player_id = $2`,
+                [room.id, playerId]
+            );
+
+            if (membership.rowCount === 0) {
+                return res.status(403).json({
+                    error: "You are not in this room"
+                });
+            }
 
             if (room.owner_player_id === playerId) {
                 await pool.query(
@@ -301,9 +286,8 @@ function registerBackboneRoutes(app, pool) {
                 success: true,
                 message: "Left room"
             });
-
         } catch (error) {
-            console.error("Leave room error:", error);
+            console.error("Leave room:", error);
 
             res.status(500).json({
                 error: "Could not leave room"
@@ -311,18 +295,15 @@ function registerBackboneRoutes(app, pool) {
         }
     });
 
-    // Marcar jogador como pronto
-    app.patch("/api/backbone/rooms/:code/ready", async (req, res) => {
-        const code = String(req.params.code || "").toUpperCase();
-        const { playerId, ready } = req.body;
+    // Marcar como pronto
+    router.patch("/rooms/:code/ready", async (req, res) => {
+        const code = String(req.params.code).toUpperCase();
+        const playerId = req.player.id;
+        const { ready } = req.body;
 
-        if (
-            !Number.isInteger(playerId) ||
-            playerId <= 0 ||
-            typeof ready !== "boolean"
-        ) {
+        if (typeof ready !== "boolean") {
             return res.status(400).json({
-                error: "Invalid player or ready status"
+                error: "Ready must be true or false"
             });
         }
 
@@ -341,7 +322,7 @@ function registerBackboneRoutes(app, pool) {
 
             if (result.rowCount === 0) {
                 return res.status(404).json({
-                    error: "Room or player not found"
+                    error: "Room or membership not found"
                 });
             }
 
@@ -349,9 +330,8 @@ function registerBackboneRoutes(app, pool) {
                 success: true,
                 ready
             });
-
         } catch (error) {
-            console.error("Ready error:", error);
+            console.error("Ready:", error);
 
             res.status(500).json({
                 error: "Could not update ready status"
@@ -359,20 +339,19 @@ function registerBackboneRoutes(app, pool) {
         }
     });
 
-    // Escolher mapa
-    app.patch("/api/backbone/rooms/:code/map", async (req, res) => {
-        const code = String(req.params.code || "").toUpperCase();
-        const { playerId, map } = req.body;
+    // Escolher mapa (somente o dono)
+    router.patch("/rooms/:code/map", async (req, res) => {
+        const code = String(req.params.code).toUpperCase();
+        const playerId = req.player.id;
+        const { map } = req.body;
 
         if (
-            !Number.isInteger(playerId) ||
-            playerId <= 0 ||
             typeof map !== "string" ||
             map.trim().length < 1 ||
             map.trim().length > 100
         ) {
             return res.status(400).json({
-                error: "Invalid player or map"
+                error: "Invalid map"
             });
         }
 
@@ -389,7 +368,7 @@ function registerBackboneRoutes(app, pool) {
 
             if (result.rowCount === 0) {
                 return res.status(403).json({
-                    error: "Only the room owner can select the map"
+                    error: "Only the owner can select the map"
                 });
             }
 
@@ -397,9 +376,8 @@ function registerBackboneRoutes(app, pool) {
                 success: true,
                 room: result.rows[0]
             });
-
         } catch (error) {
-            console.error("Select map error:", error);
+            console.error("Select map:", error);
 
             res.status(500).json({
                 error: "Could not select map"
@@ -408,16 +386,9 @@ function registerBackboneRoutes(app, pool) {
     });
 
     // Iniciar partida
-    app.post("/api/backbone/rooms/:code/start", async (req, res) => {
-        const code = String(req.params.code || "").toUpperCase();
-        const { playerId } = req.body;
-
-        if (!Number.isInteger(playerId) || playerId <= 0) {
-            return res.status(400).json({
-                error: "Invalid player ID"
-            });
-        }
-
+    router.post("/rooms/:code/start", async (req, res) => {
+        const code = String(req.params.code).toUpperCase();
+        const playerId = req.player.id;
         const client = await pool.connect();
 
         try {
@@ -432,6 +403,7 @@ function registerBackboneRoutes(app, pool) {
 
             if (result.rowCount === 0) {
                 await client.query("ROLLBACK");
+
                 return res.status(404).json({
                     error: "Room not found"
                 });
@@ -441,6 +413,7 @@ function registerBackboneRoutes(app, pool) {
 
             if (room.owner_player_id !== playerId) {
                 await client.query("ROLLBACK");
+
                 return res.status(403).json({
                     error: "Only the owner can start"
                 });
@@ -448,6 +421,7 @@ function registerBackboneRoutes(app, pool) {
 
             if (room.status !== "waiting" || !room.selected_map) {
                 await client.query("ROLLBACK");
+
                 return res.status(409).json({
                     error: "Choose a map before starting"
                 });
@@ -462,6 +436,7 @@ function registerBackboneRoutes(app, pool) {
 
             if (members.rowCount < 2) {
                 await client.query("ROLLBACK");
+
                 return res.status(409).json({
                     error: "At least two players are required"
                 });
@@ -475,6 +450,7 @@ function registerBackboneRoutes(app, pool) {
 
             if (notReady) {
                 await client.query("ROLLBACK");
+
                 return res.status(409).json({
                     error: "All other players must be ready"
                 });
@@ -495,10 +471,9 @@ function registerBackboneRoutes(app, pool) {
                 map: room.selected_map,
                 status: "starting"
             });
-
         } catch (error) {
             await client.query("ROLLBACK");
-            console.error("Start room error:", error);
+            console.error("Start room:", error);
 
             res.status(500).json({
                 error: "Could not start match"
@@ -507,9 +482,10 @@ function registerBackboneRoutes(app, pool) {
             client.release();
         }
     });
+
+    app.use("/api/backbone", router);
 }
 
 module.exports = {
-    registerBackboneRoutes,
-    generateRoomCode
+    registerBackboneRoutes
 };
