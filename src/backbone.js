@@ -1,15 +1,21 @@
 
+const express = require("express");
+const crypto = require("crypto");
+
 function registerBackboneRoutes(app, pool, accountAuth) {
-    const express = require("express");
     const router = express.Router();
 
-    // Todas as rotas exigem uma conta autenticada.
     router.use(accountAuth);
+
+    function generateRoomCode() {
+        const number = crypto.randomInt(0, 10000);
+        return `SGX${String(number).padStart(4, "0")}`;
+    }
 
     // Criar sala
     router.post("/rooms", async (req, res) => {
         const playerId = req.player.id;
-        const maxPlayers = req.body.maxPlayers ?? 4;
+        const maxPlayers = Number(req.body.maxPlayers ?? 4);
 
         if (
             !Number.isInteger(maxPlayers) ||
@@ -17,7 +23,7 @@ function registerBackboneRoutes(app, pool, accountAuth) {
             maxPlayers > 16
         ) {
             return res.status(400).json({
-                error: "Invalid player limit"
+                error: "maxPlayers must be between 2 and 16"
             });
         }
 
@@ -26,55 +32,53 @@ function registerBackboneRoutes(app, pool, accountAuth) {
         try {
             await client.query("BEGIN");
 
-            let room = null;
+            for (let attempt = 0; attempt < 10; attempt++) {
+                const code = generateRoomCode();
 
-            for (let attempt = 0; attempt < 30; attempt++) {
-                const number = require("crypto").randomInt(0, 10000);
-                const code = "SGX" + String(number).padStart(4, "0");
-
-                const result = await client.query(
+                const created = await client.query(
                     `INSERT INTO backbone_rooms
-                    (code, owner_player_id, max_players)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (code) DO NOTHING
-                    RETURNING *`,
+                        (code, owner_player_id, max_players)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (code) DO NOTHING
+                     RETURNING id, code, owner_player_id,
+                               selected_map, status, max_players,
+                               created_at`,
                     [code, playerId, maxPlayers]
                 );
 
-                if (result.rowCount > 0) {
-                    room = result.rows[0];
-                    break;
+                if (created.rowCount === 0) {
+                    continue;
                 }
-            }
 
-            if (!room) {
-                await client.query("ROLLBACK");
-                return res.status(503).json({
-                    error: "Could not generate room code"
+                const room = created.rows[0];
+
+                await client.query(
+                    `INSERT INTO backbone_room_members
+                        (room_id, player_id)
+                     VALUES ($1, $2)`,
+                    [room.id, playerId]
+                );
+
+                await client.query("COMMIT");
+
+                return res.status(201).json({
+                    message: "Room created",
+                    room: {
+                        ...room,
+                        members: [{
+                            player_id: playerId,
+                            is_ready: false
+                        }]
+                    }
                 });
             }
 
-            await client.query(
-                `INSERT INTO backbone_room_members
-                (room_id, player_id)
-                VALUES ($1, $2)`,
-                [room.id, playerId]
-            );
+            throw new Error("Could not generate a unique room code");
 
-            await client.query("COMMIT");
-
-            res.status(201).json({
-                success: true,
-                room: {
-                    code: room.code,
-                    ownerPlayerId: playerId,
-                    maxPlayers: room.max_players,
-                    status: room.status
-                }
-            });
         } catch (error) {
             await client.query("ROLLBACK");
-            console.error("Create room:", error);
+
+            console.error("Create room error:", error);
 
             res.status(500).json({
                 error: "Could not create room"
@@ -84,11 +88,11 @@ function registerBackboneRoutes(app, pool, accountAuth) {
         }
     });
 
-    // Consultar sala e jogadores
+    // Consultar sala
     router.get("/rooms/:code", async (req, res) => {
-        const code = String(req.params.code).toUpperCase();
+        const code = req.params.code;
 
-        if (!/^SGX\d{4}$/.test(code)) {
+        if (!/^SGX[0-9]{4}$/.test(code)) {
             return res.status(400).json({
                 error: "Invalid room code"
             });
@@ -107,17 +111,22 @@ function registerBackboneRoutes(app, pool, accountAuth) {
                     COALESCE(
                         json_agg(
                             json_build_object(
-                                'playerId', m.player_id,
-                                'ready', m.is_ready
+                                'player_id', m.player_id,
+                                'nickname', p.nickname,
+                                'tag_number', p.tag_number,
+                                'is_ready', m.is_ready
                             )
-                        ) FILTER (WHERE m.player_id IS NOT NULL),
-                        '[]'
-                    ) AS players
-                FROM backbone_rooms r
-                LEFT JOIN backbone_room_members m
+                            ORDER BY m.joined_at
+                        ) FILTER (WHERE m.id IS NOT NULL),
+                        '[]'::json
+                    ) AS members
+                 FROM backbone_rooms r
+                 LEFT JOIN backbone_room_members m
                     ON m.room_id = r.id
-                WHERE r.code = $1
-                GROUP BY r.id`,
+                 LEFT JOIN players p
+                    ON p.id = m.player_id
+                 WHERE r.code = $1
+                 GROUP BY r.id`,
                 [code]
             );
 
@@ -127,44 +136,54 @@ function registerBackboneRoutes(app, pool, accountAuth) {
                 });
             }
 
-            res.json({
-                success: true,
-                room: result.rows[0]
-            });
+            const room = result.rows[0];
+
+            const isMember = room.members.some(
+                member => String(member.player_id) === String(req.player.id)
+            );
+
+            if (!isMember) {
+                return res.status(403).json({
+                    error: "You are not a member of this room"
+                });
+            }
+
+            res.json({ room });
+
         } catch (error) {
-            console.error("Get room:", error);
+            console.error("Get room error:", error);
 
             res.status(500).json({
-                error: "Could not get room"
+                error: "Could not retrieve room"
             });
         }
     });
 
-    // Entrar na sala
+    // Entrar em uma sala
     router.post("/rooms/:code/join", async (req, res) => {
-        const code = String(req.params.code).toUpperCase();
+        const code = req.params.code;
         const playerId = req.player.id;
-        const client = await pool.connect();
 
-        if (!/^SGX\d{4}$/.test(code)) {
-            client.release();
-
+        if (!/^SGX[0-9]{4}$/.test(code)) {
             return res.status(400).json({
                 error: "Invalid room code"
             });
         }
 
+        const client = await pool.connect();
+
         try {
             await client.query("BEGIN");
 
-            const result = await client.query(
-                `SELECT * FROM backbone_rooms
-                WHERE code = $1
-                FOR UPDATE`,
+            const roomResult = await client.query(
+                `SELECT *
+                 FROM backbone_rooms
+                 WHERE code = $1
+                 FOR UPDATE`,
                 [code]
             );
 
-            if (result.rowCount === 0) {
+            if (roomResult.rowCount === 0) {
                 await client.query("ROLLBACK");
 
                 return res.status(404).json({
@@ -172,7 +191,7 @@ function registerBackboneRoutes(app, pool, accountAuth) {
                 });
             }
 
-            const room = result.rows[0];
+            const room = roomResult.rows[0];
 
             if (room.status !== "waiting") {
                 await client.query("ROLLBACK");
@@ -183,45 +202,54 @@ function registerBackboneRoutes(app, pool, accountAuth) {
             }
 
             const existing = await client.query(
-                `SELECT id FROM backbone_room_members
-                WHERE room_id = $1 AND player_id = $2`,
+                `SELECT id
+                 FROM backbone_room_members
+                 WHERE room_id = $1 AND player_id = $2`,
                 [room.id, playerId]
             );
 
-            if (existing.rowCount === 0) {
-                const count = await client.query(
-                    `SELECT COUNT(*)::int AS total
-                    FROM backbone_room_members
-                    WHERE room_id = $1`,
-                    [room.id]
-                );
+            if (existing.rowCount > 0) {
+                await client.query("COMMIT");
 
-                if (count.rows[0].total >= room.max_players) {
-                    await client.query("ROLLBACK");
-
-                    return res.status(409).json({
-                        error: "Room is full"
-                    });
-                }
-
-                await client.query(
-                    `INSERT INTO backbone_room_members
-                    (room_id, player_id)
-                    VALUES ($1, $2)`,
-                    [room.id, playerId]
-                );
+                return res.json({
+                    message: "Already in room",
+                    code
+                });
             }
+
+            const countResult = await client.query(
+                `SELECT COUNT(*)::int AS total
+                 FROM backbone_room_members
+                 WHERE room_id = $1`,
+                [room.id]
+            );
+
+            if (countResult.rows[0].total >= room.max_players) {
+                await client.query("ROLLBACK");
+
+                return res.status(409).json({
+                    error: "Room is full"
+                });
+            }
+
+            await client.query(
+                `INSERT INTO backbone_room_members
+                    (room_id, player_id)
+                 VALUES ($1, $2)`,
+                [room.id, playerId]
+            );
 
             await client.query("COMMIT");
 
             res.json({
-                success: true,
-                code,
-                message: "Joined room"
+                message: "Joined room",
+                code
             });
+
         } catch (error) {
             await client.query("ROLLBACK");
-            console.error("Join room:", error);
+
+            console.error("Join room error:", error);
 
             res.status(500).json({
                 error: "Could not join room"
@@ -231,107 +259,141 @@ function registerBackboneRoutes(app, pool, accountAuth) {
         }
     });
 
-    // Sair da sala
+    // Sair de uma sala
     router.post("/rooms/:code/leave", async (req, res) => {
-        const code = String(req.params.code).toUpperCase();
+        const code = req.params.code;
         const playerId = req.player.id;
 
+        if (!/^SGX[0-9]{4}$/.test(code)) {
+            return res.status(400).json({
+                error: "Invalid room code"
+            });
+        }
+
+        const client = await pool.connect();
+
         try {
-            const result = await pool.query(
-                `SELECT id, owner_player_id
-                FROM backbone_rooms
-                WHERE code = $1`,
+            await client.query("BEGIN");
+
+            const roomResult = await client.query(
+                `SELECT *
+                 FROM backbone_rooms
+                 WHERE code = $1
+                 FOR UPDATE`,
                 [code]
             );
 
-            if (result.rowCount === 0) {
+            if (roomResult.rowCount === 0) {
+                await client.query("ROLLBACK");
+
                 return res.status(404).json({
                     error: "Room not found"
                 });
             }
 
-            const room = result.rows[0];
+            const room = roomResult.rows[0];
 
-            const membership = await pool.query(
-                `SELECT id FROM backbone_room_members
-                WHERE room_id = $1 AND player_id = $2`,
+            const membership = await client.query(
+                `DELETE FROM backbone_room_members
+                 WHERE room_id = $1 AND player_id = $2
+                 RETURNING player_id`,
                 [room.id, playerId]
             );
 
             if (membership.rowCount === 0) {
+                await client.query("ROLLBACK");
+
                 return res.status(403).json({
-                    error: "You are not in this room"
+                    error: "You are not a member of this room"
                 });
             }
 
-            if (room.owner_player_id === playerId) {
-                await pool.query(
+            const remaining = await client.query(
+                `SELECT player_id
+                 FROM backbone_room_members
+                 WHERE room_id = $1
+                 ORDER BY joined_at ASC
+                 LIMIT 1`,
+                [room.id]
+            );
+
+            if (remaining.rowCount === 0) {
+                await client.query(
                     `DELETE FROM backbone_rooms WHERE id = $1`,
                     [room.id]
                 );
-
-                return res.json({
-                    success: true,
-                    message: "Room closed"
-                });
+            } else if (String(room.owner_player_id) === String(playerId)) {
+                await client.query(
+                    `UPDATE backbone_rooms
+                     SET owner_player_id = $1
+                     WHERE id = $2`,
+                    [remaining.rows[0].player_id, room.id]
+                );
             }
 
-            await pool.query(
-                `DELETE FROM backbone_room_members
-                WHERE room_id = $1 AND player_id = $2`,
-                [room.id, playerId]
-            );
+            await client.query("COMMIT");
 
             res.json({
-                success: true,
                 message: "Left room"
             });
+
         } catch (error) {
-            console.error("Leave room:", error);
+            await client.query("ROLLBACK");
+
+            console.error("Leave room error:", error);
 
             res.status(500).json({
                 error: "Could not leave room"
             });
+        } finally {
+            client.release();
         }
     });
 
-    // Marcar como pronto
+    // Marcar ou desmarcar prontidão
     router.patch("/rooms/:code/ready", async (req, res) => {
-        const code = String(req.params.code).toUpperCase();
+        const code = req.params.code;
+        const isReady = req.body.isReady;
         const playerId = req.player.id;
-        const { ready } = req.body;
 
-        if (typeof ready !== "boolean") {
+        if (!/^SGX[0-9]{4}$/.test(code)) {
             return res.status(400).json({
-                error: "Ready must be true or false"
+                error: "Invalid room code"
+            });
+        }
+
+        if (typeof isReady !== "boolean") {
+            return res.status(400).json({
+                error: "isReady must be true or false"
             });
         }
 
         try {
             const result = await pool.query(
                 `UPDATE backbone_room_members m
-                SET is_ready = $1
-                FROM backbone_rooms r
-                WHERE r.id = m.room_id
-                AND r.code = $2
-                AND m.player_id = $3
-                AND r.status = 'waiting'
-                RETURNING m.player_id`,
-                [ready, code, playerId]
+                 SET is_ready = $1
+                 FROM backbone_rooms r
+                 WHERE m.room_id = r.id
+                 AND r.code = $2
+                 AND r.status = 'waiting'
+                 AND m.player_id = $3
+                 RETURNING m.player_id, m.is_ready`,
+                [isReady, code, playerId]
             );
 
             if (result.rowCount === 0) {
                 return res.status(404).json({
-                    error: "Room or membership not found"
+                    error: "Room not found, not waiting, or player is not a member"
                 });
             }
 
             res.json({
-                success: true,
-                ready
+                message: "Ready status updated",
+                player: result.rows[0]
             });
+
         } catch (error) {
-            console.error("Ready:", error);
+            console.error("Ready status error:", error);
 
             res.status(500).json({
                 error: "Could not update ready status"
@@ -339,45 +401,52 @@ function registerBackboneRoutes(app, pool, accountAuth) {
         }
     });
 
-    // Escolher mapa (somente o dono)
+    // Escolher mapa
     router.patch("/rooms/:code/map", async (req, res) => {
-        const code = String(req.params.code).toUpperCase();
+        const code = req.params.code;
+        const map = req.body.map;
         const playerId = req.player.id;
-        const { map } = req.body;
+
+        if (!/^SGX[0-9]{4}$/.test(code)) {
+            return res.status(400).json({
+                error: "Invalid room code"
+            });
+        }
 
         if (
             typeof map !== "string" ||
-            map.trim().length < 1 ||
-            map.trim().length > 100
+            map.trim().length === 0 ||
+            map.length > 100
         ) {
             return res.status(400).json({
-                error: "Invalid map"
+                error: "Invalid map name"
             });
         }
 
         try {
             const result = await pool.query(
                 `UPDATE backbone_rooms
-                SET selected_map = $1
-                WHERE code = $2
-                AND owner_player_id = $3
-                AND status = 'waiting'
-                RETURNING code, selected_map`,
+                 SET selected_map = $1
+                 WHERE code = $2
+                 AND owner_player_id = $3
+                 AND status = 'waiting'
+                 RETURNING code, selected_map`,
                 [map.trim(), code, playerId]
             );
 
             if (result.rowCount === 0) {
                 return res.status(403).json({
-                    error: "Only the owner can select the map"
+                    error: "Room not found or only the owner can select the map"
                 });
             }
 
             res.json({
-                success: true,
+                message: "Map selected",
                 room: result.rows[0]
             });
+
         } catch (error) {
-            console.error("Select map:", error);
+            console.error("Map selection error:", error);
 
             res.status(500).json({
                 error: "Could not select map"
@@ -385,23 +454,32 @@ function registerBackboneRoutes(app, pool, accountAuth) {
         }
     });
 
-    // Iniciar partida
+    // Iniciar partida e criar sessão
     router.post("/rooms/:code/start", async (req, res) => {
-        const code = String(req.params.code).toUpperCase();
+        const code = req.params.code;
         const playerId = req.player.id;
         const client = await pool.connect();
+
+        if (!/^SGX[0-9]{4}$/.test(code)) {
+            client.release();
+
+            return res.status(400).json({
+                error: "Invalid room code"
+            });
+        }
 
         try {
             await client.query("BEGIN");
 
-            const result = await client.query(
-                `SELECT * FROM backbone_rooms
-                WHERE code = $1
-                FOR UPDATE`,
+            const roomResult = await client.query(
+                `SELECT *
+                 FROM backbone_rooms
+                 WHERE code = $1
+                 FOR UPDATE`,
                 [code]
             );
 
-            if (result.rowCount === 0) {
+            if (roomResult.rowCount === 0) {
                 await client.query("ROLLBACK");
 
                 return res.status(404).json({
@@ -409,13 +487,13 @@ function registerBackboneRoutes(app, pool, accountAuth) {
                 });
             }
 
-            const room = result.rows[0];
+            const room = roomResult.rows[0];
 
-            if (room.owner_player_id !== playerId) {
+            if (String(room.owner_player_id) !== String(playerId)) {
                 await client.query("ROLLBACK");
 
                 return res.status(403).json({
-                    error: "Only the owner can start"
+                    error: "Only the room owner can start"
                 });
             }
 
@@ -423,14 +501,14 @@ function registerBackboneRoutes(app, pool, accountAuth) {
                 await client.query("ROLLBACK");
 
                 return res.status(409).json({
-                    error: "Choose a map before starting"
+                    error: "Room is not ready to start"
                 });
             }
 
             const members = await client.query(
                 `SELECT player_id, is_ready
-                FROM backbone_room_members
-                WHERE room_id = $1`,
+                 FROM backbone_room_members
+                 WHERE room_id = $1`,
                 [room.id]
             );
 
@@ -438,45 +516,143 @@ function registerBackboneRoutes(app, pool, accountAuth) {
                 await client.query("ROLLBACK");
 
                 return res.status(409).json({
-                    error: "At least two players are required"
+                    error: "At least 2 players are required"
                 });
             }
 
-            const notReady = members.rows.some(
-                member =>
-                    member.player_id !== playerId &&
-                    !member.is_ready
-            );
-
-            if (notReady) {
+            if (members.rows.some(member => !member.is_ready)) {
                 await client.query("ROLLBACK");
 
                 return res.status(409).json({
-                    error: "All other players must be ready"
+                    error: "All players must be ready"
                 });
             }
 
+            const sessionResult = await client.query(
+                `INSERT INTO backbone_game_sessions
+                    (room_id, map_name, status)
+                 VALUES ($1, $2, 'active')
+                 RETURNING id, room_id, map_name, status, created_at`,
+                [room.id, room.selected_map]
+            );
+
             await client.query(
                 `UPDATE backbone_rooms
-                SET status = 'starting'
-                WHERE id = $1`,
+                 SET status = 'playing'
+                 WHERE id = $1`,
                 [room.id]
             );
 
             await client.query("COMMIT");
 
             res.json({
-                success: true,
-                code,
-                map: room.selected_map,
-                status: "starting"
+                message: "Game session started",
+                session: sessionResult.rows[0]
             });
+
         } catch (error) {
             await client.query("ROLLBACK");
-            console.error("Start room:", error);
+
+            console.error("Start game error:", error);
 
             res.status(500).json({
-                error: "Could not start match"
+                error: "Could not start game session"
+            });
+        } finally {
+            client.release();
+        }
+    });
+
+    // Encerrar sessão de jogo
+    router.post("/rooms/:code/finish", async (req, res) => {
+        const code = req.params.code;
+        const playerId = req.player.id;
+        const client = await pool.connect();
+
+        if (!/^SGX[0-9]{4}$/.test(code)) {
+            client.release();
+
+            return res.status(400).json({
+                error: "Invalid room code"
+            });
+        }
+
+        try {
+            await client.query("BEGIN");
+
+            const roomResult = await client.query(
+                `SELECT *
+                 FROM backbone_rooms
+                 WHERE code = $1
+                 FOR UPDATE`,
+                [code]
+            );
+
+            if (roomResult.rowCount === 0) {
+                await client.query("ROLLBACK");
+
+                return res.status(404).json({
+                    error: "Room not found"
+                });
+            }
+
+            const room = roomResult.rows[0];
+
+            if (String(room.owner_player_id) !== String(playerId)) {
+                await client.query("ROLLBACK");
+
+                return res.status(403).json({
+                    error: "Only the room owner can finish"
+                });
+            }
+
+            if (room.status !== "playing") {
+                await client.query("ROLLBACK");
+
+                return res.status(409).json({
+                    error: "Room is not playing"
+                });
+            }
+
+            const sessionResult = await client.query(
+                `UPDATE backbone_game_sessions
+                 SET status = 'finished',
+                     finished_at = NOW()
+                 WHERE room_id = $1
+                 AND status = 'active'
+                 RETURNING id, status, finished_at`,
+                [room.id]
+            );
+
+            if (sessionResult.rowCount === 0) {
+                await client.query("ROLLBACK");
+
+                return res.status(409).json({
+                    error: "Active game session not found"
+                });
+            }
+
+            await client.query(
+                `UPDATE backbone_rooms
+                 SET status = 'finished'
+                 WHERE id = $1`,
+                [room.id]
+            );
+
+            await client.query("COMMIT");
+
+            res.json({
+                message: "Game session finished",
+                session: sessionResult.rows[0]
+            });
+
+        } catch (error) {
+            await client.query("ROLLBACK");
+
+            console.error("Finish game error:", error);
+
+            res.status(500).json({
+                error: "Could not finish game session"
             });
         } finally {
             client.release();
