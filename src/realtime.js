@@ -1,144 +1,241 @@
 
-const WebSocket = require("ws");
+const { WebSocketServer } = require("ws");
+const { hashToken, validateToken } = require("./auth");
 
 function attachRealtimeServer(server, pool) {
-    const wss = new WebSocket.Server({
+    const wss = new WebSocketServer({
         server,
-        path: "/realtime"
+        path: "/realtime",
+        maxPayload: 16 * 1024
     });
 
-    const rooms = new Map();
+    const roomClients = new Map();
 
-    wss.on("connection", (socket) => {
-        let currentRoom = null;
-        let playerId = null;
+    function send(ws, data) {
+        if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify(data));
+        }
+    }
 
-        socket.on("message", async (raw) => {
+    function broadcast(roomCode, data, excludedClient = null) {
+        const clients = roomClients.get(roomCode);
+
+        if (!clients) return;
+
+        for (const client of clients) {
+            if (client !== excludedClient) {
+                send(client, data);
+            }
+        }
+    }
+
+    function leaveRoom(ws, roomCode) {
+        const clients = roomClients.get(roomCode);
+
+        if (!clients) return;
+
+        clients.delete(ws);
+
+        if (clients.size === 0) {
+            roomClients.delete(roomCode);
+        }
+
+        ws.rooms.delete(roomCode);
+
+        broadcast(roomCode, {
+            type: "room.member_left",
+            playerId: ws.player.id
+        });
+    }
+
+    wss.on("connection", (ws) => {
+        ws.player = null;
+        ws.rooms = new Set();
+
+        ws.on("message", async (rawMessage) => {
             try {
-                const message = JSON.parse(raw.toString());
+                let message;
 
-                if (message.type === "ping") {
-                    socket.send(JSON.stringify({ type: "pong" }));
-                    return;
+                try {
+                    message = JSON.parse(rawMessage.toString());
+                } catch {
+                    return send(ws, {
+                        type: "error",
+                        error: "Invalid JSON"
+                    });
+                }
+
+                if (!message || typeof message.type !== "string") {
+                    return send(ws, {
+                        type: "error",
+                        error: "Invalid message"
+                    });
                 }
 
                 if (message.type === "auth") {
-                    if (!message.token) {
-                        socket.close(1008, "Token required");
-                        return;
+                    if (ws.player) {
+                        return send(ws, {
+                            type: "error",
+                            error: "Already authenticated"
+                        });
+                    }
+
+                    const token = message.token;
+
+                    if (!validateToken(token)) {
+                        return send(ws, {
+                            type: "auth.failed",
+                            error: "Invalid account token"
+                        });
                     }
 
                     const result = await pool.query(
-                        `SELECT id FROM players
-                         WHERE account_key = $1 LIMIT 1`,
-                        [message.token]
+                        `SELECT id, nickname, tag_number
+                         FROM players
+                         WHERE account_key = $1
+                         AND is_bot = FALSE
+                         LIMIT 1`,
+                        [hashToken(token)]
                     );
 
                     if (result.rowCount === 0) {
-                        socket.close(1008, "Invalid account");
-                        return;
+                        return send(ws, {
+                            type: "auth.failed",
+                            error: "Account not found"
+                        });
                     }
 
-                    playerId = result.rows[0].id;
+                    ws.player = result.rows[0];
 
-                    socket.send(JSON.stringify({
+                    return send(ws, {
                         type: "auth.success",
-                        playerId
-                    }));
-                    return;
+                        player: ws.player
+                    });
                 }
 
-                if (!playerId) {
-                    socket.close(1008, "Authentication required");
-                    return;
+                if (!ws.player) {
+                    return send(ws, {
+                        type: "error",
+                        error: "Authentication required"
+                    });
+                }
+
+                if (message.type === "ping") {
+                    return send(ws, {
+                        type: "pong",
+                        timestamp: Date.now()
+                    });
                 }
 
                 if (message.type === "room.join") {
-                    const code = String(message.code || "");
+                    const roomCode = message.code;
 
-                    const result = await pool.query(
-                        `SELECT id FROM rooms WHERE code = $1`,
-                        [code]
+                    if (
+                        typeof roomCode !== "string" ||
+                        !/^SGX[0-9]{4}$/.test(roomCode)
+                    ) {
+                        return send(ws, {
+                            type: "error",
+                            error: "Invalid room code"
+                        });
+                    }
+
+                    const membership = await pool.query(
+                        `SELECT r.code, r.status
+                         FROM backbone_rooms r
+                         INNER JOIN backbone_room_members m
+                            ON m.room_id = r.id
+                         WHERE r.code = $1
+                         AND m.player_id = $2
+                         LIMIT 1`,
+                        [roomCode, ws.player.id]
                     );
 
-                    if (result.rowCount === 0) {
-                        socket.send(JSON.stringify({
+                    if (membership.rowCount === 0) {
+                        return send(ws, {
                             type: "error",
-                            message: "Room not found"
-                        }));
-                        return;
+                            error: "You are not a member of this room"
+                        });
                     }
 
-                    if (currentRoom) {
-                        rooms.get(currentRoom)?.delete(socket);
+                    if (ws.rooms.has(roomCode)) {
+                        return send(ws, {
+                            type: "room.joined",
+                            code: roomCode
+                        });
                     }
 
-                    currentRoom = code;
-
-                    if (!rooms.has(code)) {
-                        rooms.set(code, new Set());
+                    if (!roomClients.has(roomCode)) {
+                        roomClients.set(roomCode, new Set());
                     }
 
-                    rooms.get(code).add(socket);
+                    roomClients.get(roomCode).add(ws);
+                    ws.rooms.add(roomCode);
 
-                    socket.send(JSON.stringify({
+                    send(ws, {
                         type: "room.joined",
-                        code
-                    }));
-
-                    broadcast(code, {
-                        type: "room.player_joined",
-                        playerId
+                        code: roomCode
                     });
+
+                    broadcast(roomCode, {
+                        type: "room.member_connected",
+                        playerId: ws.player.id
+                    }, ws);
 
                     return;
                 }
 
                 if (message.type === "room.leave") {
-                    leaveRoom();
+                    const roomCode = message.code;
+
+                    if (typeof roomCode !== "string") {
+                        return send(ws, {
+                            type: "error",
+                            error: "Invalid room code"
+                        });
+                    }
+
+                    if (ws.rooms.has(roomCode)) {
+                        leaveRoom(ws, roomCode);
+                    }
+
+                    return send(ws, {
+                        type: "room.left",
+                        code: roomCode
+                    });
                 }
-            } catch (error) {
-                socket.send(JSON.stringify({
+
+                send(ws, {
                     type: "error",
-                    message: "Invalid message"
-                }));
+                    error: "Unknown message type"
+                });
+
+            } catch (error) {
+                console.error("Backbone realtime error:", error);
+
+                send(ws, {
+                    type: "error",
+                    error: "Realtime operation failed"
+                });
             }
         });
 
-        function leaveRoom() {
-            if (!currentRoom) return;
-
-            rooms.get(currentRoom)?.delete(socket);
-
-            broadcast(currentRoom, {
-                type: "room.player_left",
-                playerId
-            });
-
-            if (rooms.get(currentRoom)?.size === 0) {
-                rooms.delete(currentRoom);
+        ws.on("close", () => {
+            for (const roomCode of [...ws.rooms]) {
+                leaveRoom(ws, roomCode);
             }
+        });
 
-            currentRoom = null;
-        }
-
-        socket.on("close", leaveRoom);
+        ws.on("error", (error) => {
+            console.error("Backbone WebSocket error:", error.message);
+        });
     });
 
-    function broadcast(code, data) {
-        const members = rooms.get(code);
-        if (!members) return;
-
-        const payload = JSON.stringify(data);
-
-        for (const client of members) {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(payload);
-            }
-        }
-    }
+    console.log("Backbone realtime WebSocket initialized");
 
     return wss;
 }
 
-module.exports = { attachRealtimeServer };
+module.exports = {
+    attachRealtimeServer
+};
