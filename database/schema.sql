@@ -29,6 +29,19 @@ CREATE TABLE IF NOT EXISTS backbone_room_members (
     UNIQUE (room_id, player_id)
 );
 
+CREATE TABLE IF NOT EXISTS backbone_game_sessions (
+    id BIGSERIAL PRIMARY KEY,
+    room_id BIGINT NOT NULL
+        REFERENCES backbone_rooms(id) ON DELETE CASCADE,
+    map_name VARCHAR(100) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMPTZ,
+
+    CONSTRAINT backbone_session_status
+        CHECK (status IN ('active', 'finished'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_backbone_rooms_code
     ON backbone_rooms(code);
 
@@ -40,3 +53,6 @@ CREATE INDEX IF NOT EXISTS idx_backbone_members_player
 
 CREATE INDEX IF NOT EXISTS idx_backbone_members_room
     ON backbone_room_members(room_id);
+
+CREATE INDEX IF NOT EXISTS idx_backbone_sessions_room
+    ON backbone_game_sessions(room_id);
