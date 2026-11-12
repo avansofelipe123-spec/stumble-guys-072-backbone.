@@ -35,7 +35,7 @@ function createAccountAuth(pool) {
             }
 
             const result = await pool.query(
-                `SELECT id, nickname, tag_number, gems, tokens
+                `SELECT id, nickname, tag_number
                  FROM players
                  WHERE account_key = $1
                  AND is_bot = FALSE
@@ -54,9 +54,12 @@ function createAccountAuth(pool) {
             next();
 
         } catch (error) {
-            console.error("Backbone authentication error:", error);
+            console.error(
+                "Backbone authentication error:",
+                error.message
+            );
 
-            res.status(500).json({
+            return res.status(500).json({
                 error: "Authentication failed"
             });
         }
