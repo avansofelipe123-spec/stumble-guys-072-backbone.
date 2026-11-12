@@ -2,10 +2,11 @@
 {
   "name": "stumble-guys-072-backbone",
   "version": "1.0.0",
-  "description": "Backbone multiplayer do Stumble Guys 0.72",
+  "description": "Infraestrutura multiplayer Backbone para Stumble Guys 0.72",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "check": "node --check src/server.js && node --check src/auth.js && node --check src/backbone.js && node --check src/realtime.js && node --check src/matchmaking.js && node --check src/game-sessions.js"
   },
   "engines": {
     "node": ">=20"
